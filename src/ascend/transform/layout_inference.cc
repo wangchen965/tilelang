@@ -28,6 +28,7 @@
 #include "ascend/layout/pto_parallel_layout.h"
 #include "ascend/op/utils.h"
 #include "ascend/target_utils.h"
+#include "ascend/transform/buffer_version.h"
 #include "ascend/transform/parallel_to_pto_utils.h"
 #include "ascend/transform/vf_regions.h"
 #include "backend/common/target_utils.h"
@@ -240,6 +241,25 @@ public:
   BufferUseDefCollector() = default;
 
   using arith::IRVisitorWithAnalyzer::IRVisitorWithAnalyzer;
+
+  void VisitStmt(const Stmt &stmt) final {
+    // Flat AllocBuffer definitions remain active for later siblings. Every
+    // enclosing statement restores the allocation environment on exit.
+    if (stmt.as<AllocBufferNode>()) {
+      IRVisitorWithAnalyzer::VisitStmt(stmt);
+      return;
+    }
+    const size_t allocation_mark = active_allocations_.size();
+    BufferVersionMap saved_versions = buffer_versions_;
+    IRVisitorWithAnalyzer::VisitStmt(stmt);
+    active_allocations_.resize(allocation_mark);
+    buffer_versions_ = std::move(saved_versions);
+  }
+
+  void VisitStmt_(const AllocBufferNode *op) final {
+    active_allocations_.push_back(op->buffer);
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
 
   void RunInferStep(int cur_infer_id, InferLevel level, bool update_queue,
                     LayoutMap &layout_map, const LayoutMap &strict_layout_map,
@@ -608,13 +628,6 @@ public:
     // Copy the annotated layout map to local variable
     Map<Buffer, Layout> layout_map = annotated_layout_map_;
 
-    for (const auto &unit : pto_parallel_units_) {
-      ICHECK(!pto_loop_layouts_.count(unit.root));
-      Fragment layout =
-          pto::InferPtoParallelLayout(unit.root, unit.lane_bounds);
-      pto_loop_layouts_.Set(unit.root, layout);
-    }
-
     Map<Buffer, Layout> strict_layout_map;
     int num_infer = infer_list_.size();
 
@@ -723,9 +736,7 @@ public:
       }
     }
 
-    // PTO lane layouts were solved from the deferred unit list before generic
-    // inference. Merge them here so this result collection also runs when the
-    // worklist is empty.
+    // Include PTO lane layouts even when the generic worklist is empty.
     for (const auto &[root, layout] : pto_loop_layouts_) {
       ICHECK(layout.defined());
       ICHECK(!for_map.count(root))
@@ -1042,13 +1053,12 @@ private:
           });
 
       if (InsidePtoSimdVF() && !pto::UsesExplicitSIMD(op->body)) {
-        // PTO lane layouts are built from the original nest and stay outside
-        // the generic layout worklist. Only the outermost Parallel root of a
-        // unit is recorded; nested Parallel layers are part of this unit.
-        // Defer inference until collection has finished so later constraint
-        // producers (e.g. Fragment buffers) can be collected first.
-        pto_parallel_units_.push_back(
-            {GetRef<For>(op), CurrentPtoLaneBounds()});
+        // PTO lane layouts depend only on the nest and its lexical environment.
+        For root = GetRef<For>(op);
+        pto_loop_layouts_.Set(
+            root, pto::InferPtoParallelLayout(root, CurrentPtoLaneBounds(),
+                                              active_allocations_,
+                                              buffer_versions_, &analyzer_));
         return;
       }
 
@@ -1083,14 +1093,29 @@ private:
       in_pto_simd_vf_vec_.push_back(in_pto_simd);
       pto_lane_bounds_.push_back(in_pto_simd ? CurrentPtoLaneBounds()
                                              : Range());
+    } else if (target_is_pto_) {
+      // Candidate offset proofs need the enclosing serial range. Preserve
+      // the existing traversal for the other Ascend code generators.
+      IRVisitorWithAnalyzer::VisitStmt_(op);
     } else {
       IRVisitorWithAnalyzer::VisitStmt(op->body);
     }
   }
 
   void VisitStmt_(const SBlockNode *op) final {
+    // A manually versioned buffer already has its physical version axis.
+    // AutoSchedule adds its own axes later, with lane-uniform selectors.
+    if (target_is_pto_) {
+      if (auto versions = op->annotations.Get(kManualMultiBuffer)) {
+        for (const auto &[storage, count] :
+             versions.value().cast<BufferVersionMap>()) {
+          buffer_versions_.Set(storage, count);
+        }
+      }
+    }
     // VF-local owners may only be referenced through reshaped aliases.
     for (auto buffer : op->alloc_buffers) {
+      active_allocations_.push_back(buffer);
       if (buffer_data_to_buffers_.count(buffer->data)) {
         auto buffers = buffer_data_to_buffers_[buffer->data];
         buffers.push_back(buffer);
@@ -1348,8 +1373,8 @@ private:
     }
     // PTO lane units are not in infer_list_stmt_ but their accesses are still
     // inside a TileOp-equivalent unit, not floating accesses.
-    for (const auto &unit : pto_parallel_units_) {
-      PostOrderVisit(unit.root, [&](const ObjectRef &node) {
+    for (const auto &[root, layout] : pto_loop_layouts_) {
+      PostOrderVisit(root, [&](const ObjectRef &node) {
         nodes_in_tileops.insert(node.get());
       });
     }
@@ -1462,10 +1487,8 @@ private:
   // [0, 1) — no synthetic fallback Var is ever created.
   IterVar thread_binding_;
   std::vector<RegionThreadScope> region_thread_scope_stack_;
-  struct PtoParallelUnit {
-    For root;
-    Range lane_bounds;
-  };
+  std::vector<Buffer> active_allocations_;
+  BufferVersionMap buffer_versions_;
   // PTO SIMD_VF nesting stack. Only non-empty on the PTO target: entering a
   // SIMD_VF block under a non-PTO target keeps the stack empty so the
   // AscendC SIMD path is untouched.
@@ -1475,10 +1498,6 @@ private:
   std::vector<PtoSimdVFContext> pto_simd_ctx_stack_;
   // Whether the whole function targets PTO (keys contain "pto").
   bool target_is_pto_ = false;
-  // PTO units captured during traversal. Each retains the original outermost
-  // For and the lane bounds of the region it was collected from. Inference is
-  // deferred until collection completes.
-  std::vector<PtoParallelUnit> pto_parallel_units_;
   // PTO lane layouts keyed by the original outermost For node. These roots
   // are solved directly from the nest and never enter infer_list_ or the
   // generic layout worklist.

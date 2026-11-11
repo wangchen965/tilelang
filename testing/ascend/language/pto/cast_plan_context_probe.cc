@@ -8,7 +8,8 @@
  * classification yields (scalar lanes=1, VMI lanes=64/128/256).  The planner
  * guards for {kVectorVmi, 1} and {kScalar, 128} are therefore unreachable
  * end-to-end; this local probe calls the planner directly so those contracts
- * are tested without adding a product FFI.
+ * are tested without adding a product FFI. It also checks grouped broadcast
+ * planning for a one-lane VMI Bind alias.
  *
  * Build (from the repository root; the library lives in build/lib and the
  * TVM DSOs must be linked explicitly):
@@ -26,20 +27,25 @@
 #include <variant>
 
 #include "ascend/transform/parallel_to_pto_utils.h"
+#include <tvm/ir/op.h>
 #include <tvm/tirx/expr.h>
 
 namespace {
 
 using tvm::DataType;
+using tvm::tirx::Call;
 using tvm::tirx::Cast;
 using tvm::tirx::Var;
 using tvm::tl::pto::CastContext;
 using tvm::tl::pto::CastValueKind;
+using tvm::tl::pto::GetValueInfo;
 using tvm::tl::pto::PlanValueCast;
+using tvm::tl::pto::PlanWidthAdaptation;
 using tvm::tl::pto::ScalarCastAction;
 using tvm::tl::pto::ScalarCastPlan;
 using tvm::tl::pto::VectorCastOp;
 using tvm::tl::pto::VectorCastPlan;
+using tvm::tl::pto::WidthAdaptation;
 
 int failures = 0;
 
@@ -143,6 +149,19 @@ int main() {
               steps->steps[0].op == VectorCastOp::kIntegerReinterpret,
           "same-width cross-sign is one vinterpret_cast");
   }
+
+  const DataType dtype = DataType::Int(32);
+  Call one_lane_call(dtype, tvm::Op::Get("tl.vmi.vbrc"),
+                     {tvm::IntImm(dtype, 7)},
+                     {{"size", tvm::IntImm(dtype, 1)}});
+  Var saved("saved", dtype);
+  Var alias("alias", dtype);
+  tvm::tl::pto::ValueInfoMap bindings;
+  bindings.emplace(saved, tvm::tl::pto::ValueInfo::Vmi(one_lane_call.dtype()));
+  bindings.emplace(alias, GetValueInfo(saved, bindings));
+  Check(PlanWidthAdaptation(GetValueInfo(alias, bindings), 128) ==
+            WidthAdaptation::kBroadcastOneLane,
+        "one-lane VMI Bind alias requires grouped broadcast");
 
   return failures == 0 ? 0 : 1;
 }

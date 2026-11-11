@@ -6,12 +6,16 @@
 
 #include "pto_index_analysis.h"
 
+#include "ascend/transform/parallel_to_pto_utils.h"
+
 #include <tvm/ir/op.h>
+#include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
 #include <functional>
 #include <limits>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace tvm {
@@ -79,21 +83,37 @@ Optional<PrimExpr> ResolveIndexAliases(const PrimExpr &index,
   if (bind_env.empty()) {
     return index;
   }
-  // A Bind definition containing a BufferLoad is an SSA
-  // *value*, not a coordinate alias — never expand it into a memory read.
-  // The check runs at *every* substitution step (not only on the original
-  // index) so the value-identity rule propagates through coordinate
-  // alias chains (alias = saved; ... A[i + alias - IDX[i]]).
-  auto def_is_pure_coordinate = [&](const PrimExpr &def_expr) {
-    bool has_load = false;
-    PostOrderVisit(def_expr, [&](const ObjectRef &node) {
-      if (node.as<BufferLoadNode>()) {
-        has_load = true;
-      }
-    });
-    return !has_load;
-  };
+  // Load-dependent Bind definitions are values, including arithmetic aliases
+  // of a saved load. Keep their identity instead of creating fresh UB reads.
+  using VarSet =
+      std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+  Map<Var, Integer> load_dependency;
+  VarSet inspecting;
   constexpr int kMaxDepth = 64;
+  std::function<bool(const PrimExpr &, int)> depends_on_load =
+      [&](const PrimExpr &expr, int depth) {
+        if (depth > kMaxDepth) {
+          return false; // The ordinary alias budget diagnoses this chain.
+        }
+        bool result = false;
+        PostOrderVisit(expr, [&](const ObjectRef &node) {
+          if (node.as<BufferLoadNode>()) {
+            result = true;
+          } else if (const auto *vn = node.as<VarNode>()) {
+            Var var = GetRef<Var>(vn);
+            if (load_dependency.count(var)) {
+              result |= load_dependency[var]->value != 0;
+            } else if (bind_env.count(var) && !inspecting.count(var)) {
+              inspecting.insert(var);
+              bool dependency = depends_on_load(bind_env[var], depth + 1);
+              load_dependency.Set(var, Integer(dependency ? 1 : 0));
+              result |= dependency;
+              inspecting.erase(var);
+            }
+          }
+        });
+        return result;
+      };
   // Expression-size budget. The depth cap alone is not enough —
   // every substitution round can double the expression (x1 = i + i;
   // x2 = x1 + x1; ...), so a 26-deep chain already exploded to 2^26 nodes
@@ -107,48 +127,29 @@ Optional<PrimExpr> ResolveIndexAliases(const PrimExpr &index,
     PostOrderVisit(expr, [&](const ObjectRef &) { ++nodes; });
     return nodes;
   };
-  bool exhausted = true;
-  std::function<bool(PrimExpr &, int)> resolve = [&](PrimExpr &expr,
-                                                     int depth) -> bool {
-    if (depth > kMaxDepth) {
-      exhausted = false;
-      return false;
-    }
-    const VarNode *found = nullptr;
-    PostOrderVisit(expr, [&](const ObjectRef &node) {
-      if (found == nullptr) {
-        if (auto *var_node = node.as<VarNode>()) {
-          if (bind_env.count(GetRef<Var>(var_node))) {
-            found = var_node;
-          }
-        }
-      }
-    });
-    if (found == nullptr) {
-      return true;
-    }
-    // Check the definition *before* substituting; a load-valued
-    // definition reached through any alias depth is rejected.
-    const PrimExpr &def = bind_env[GetRef<Var>(found)];
-    if (!def_is_pure_coordinate(def)) {
-      exhausted = false;
-      return false;
-    }
-    expr = SubstituteVar(expr, found, def);
-    if (count_nodes(expr) > kMaxNodes) {
-      std::ostringstream oss;
-      oss << "bind alias resolution exceeded the expression-size budget ("
-          << kMaxNodes
-          << " nodes); the alias chain expands too much "
-             "(e.g. doubling definitions like x = y + y)";
-      throw PtoAnalysisError(oss.str());
-    }
-    return resolve(expr, depth + 1);
-  };
   PrimExpr result = index;
   try {
-    if (!resolve(result, 0) || !exhausted) {
-      return Optional<PrimExpr>();
+    for (int depth = 0; depth <= kMaxDepth; ++depth) {
+      Optional<Var> alias;
+      PostOrderVisit(result, [&](const ObjectRef &node) {
+        if (auto var = node.as<Var>(); !alias && var && bind_env.count(*var) &&
+                                       !depends_on_load(bind_env[*var], 0)) {
+          alias = var.value();
+        }
+      });
+      if (!alias) {
+        return result;
+      }
+      result =
+          SubstituteVar(result, alias.value().get(), bind_env[alias.value()]);
+      if (count_nodes(result) > kMaxNodes) {
+        std::ostringstream oss;
+        oss << "bind alias resolution exceeded the expression-size budget ("
+            << kMaxNodes
+            << " nodes); the alias chain expands too much "
+               "(e.g. doubling definitions like x = y + y)";
+        throw PtoAnalysisError(oss.str());
+      }
     }
   } catch (const ffi::Error &err) {
     // A tvm-internal failure during substitution (e.g. an int32
@@ -158,18 +159,38 @@ Optional<PrimExpr> ResolveIndexAliases(const PrimExpr &index,
         std::string("bind alias resolution hit a tvm-internal error: ") +
         err.what());
   }
-  return result;
+  return std::nullopt;
+}
+
+bool IsOrdinaryUbScope(const std::string &scope) {
+  return scope == "shared" || scope == "shared.dyn";
+}
+
+bool IsPtoIndexDType(DataType dtype) {
+  return (dtype.is_int() || dtype.is_uint()) && dtype.lanes() == 1 &&
+         (dtype.bits() == 8 || dtype.bits() == 16 || dtype.bits() == 32);
+}
+
+bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
+                           const Map<Var, PrimExpr> &bind_env) {
+  bool scalar = IsPtoIndexDType(expr.dtype());
+  PostOrderVisit(expr, [&](const ObjectRef &node) {
+    if (node.as<BufferLoadNode>() || node.as<CallNode>() ||
+        node.as<CastNode>()) {
+      scalar = false;
+    } else if (const auto *op = node.as<VarNode>()) {
+      Var var = GetRef<Var>(op);
+      scalar &= var.dtype().lanes() == 1 && !var.same_as(vector_var) &&
+                !bind_env.count(var);
+    }
+  });
+  return scalar;
 }
 
 bool IsSupportedAddressExpr(const PrimExpr &expr) {
-  // Addresses may contain coordinate arithmetic, constants, casts
-  // and pure intrinsics — anything whose per-chunk evaluation is
-  // equivalent. Opaque/extern calls (call_extern is kOpaque in TVM) have
-  // no lowering rule; evaluating them once per chunk instead of per
-  // logical point changes the program, so they are rejected. A load
-  // inside an index makes the address data-dependent: the alias resolver
-  // already rejects Bind-introduced loaded indices, and a direct load
-  // must follow the same rule.
+  // Existing coordinate arithmetic remains legal. Ordinary UB loads are
+  // classified with their lane dependence separately; calls with no index
+  // lowering and memory in other address spaces remain unsupported.
   class AddressCheck : public ExprVisitor {
   public:
     bool supported = true;
@@ -190,12 +211,354 @@ bool IsSupportedAddressExpr(const PrimExpr &expr) {
       }
       supported = false;
     }
-    void VisitExpr_(const BufferLoadNode *) final { supported = false; }
+    void VisitExpr_(const BufferLoadNode *op) final {
+      if (!IsOrdinaryUbScope(op->buffer.scope())) {
+        supported = false;
+        return;
+      }
+      ExprVisitor::VisitExpr_(op);
+    }
     void VisitExprDefault_(const ffi::Object *) final { /* fine */ }
   };
   AddressCheck checker;
   checker(expr);
   return checker.supported;
+}
+
+namespace {
+
+// This expression is used only for lane-dependence proofs. Replacing a loaded
+// value by a symbolic scalar (uniform) or symbolic coefficient times lane
+// (varying) avoids proving a varying saved load to be a uniform scalar base.
+// All occurrences of one Bind reuse its symbol; separate source loads do not.
+class LoadedValueProof : public ExprMutator {
+public:
+  LoadedValueProof(const Var &vector_var, const PrimExpr &inverse_index,
+                   const Var &lane_var, const Var &chunk_var, int64_t lanes,
+                   int64_t chunk_count, const Optional<Var> &kept_var,
+                   int64_t kept_extent, const Map<Var, PrimExpr> &bind_env)
+      : vector_var_(vector_var), inverse_index_(inverse_index),
+        lane_var_(lane_var), bind_env_(bind_env) {
+    auto bind_extent = [&](const Var &var, int64_t extent) {
+      analyzer_.Bind(var, Range::FromMinExtent(make_zero(var.dtype()),
+                                               IntImm(var.dtype(), extent)));
+    };
+    bind_extent(lane_var, lanes);
+    bind_extent(chunk_var, chunk_count);
+    if (kept_var) {
+      bind_extent(kept_var.value(), kept_extent);
+    }
+  }
+
+  // Compare each expression with the same saved values at lane zero.
+  bool IsUniform(const PrimExpr &expr) {
+    PrimExpr value = VisitExpr(expr);
+    return analyzer_.CanProveEqual(value, AtLaneZero(value));
+  }
+
+  AccessPattern Classify(const PrimExpr &offset) {
+    PrimExpr value = VisitExpr(offset);
+    PrimExpr start = AtLaneZero(value);
+    if (analyzer_.CanProveEqual(value, start + lane_var_)) {
+      return AccessPattern::kContinuous;
+    }
+    return analyzer_.CanProveEqual(value, start) ? AccessPattern::kLaneUniform
+                                                 : AccessPattern::kIndexed;
+  }
+
+private:
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = GetRef<Var>(op);
+    if (var.same_as(vector_var_)) {
+      return inverse_index_;
+    }
+    if (!bind_env_.count(var)) {
+      return var;
+    }
+    if (symbols_.count(var)) {
+      return symbols_[var];
+    }
+    if (visiting_.count(var) || visiting_.size() >= 64) {
+      throw PtoAnalysisError("cyclic or too deep loaded index Bind definition");
+    }
+    visiting_.insert(var);
+    bool uniform = IsUniform(bind_env_[var]);
+    visiting_.erase(var);
+    // Preserve the entire definition's identity, even for an arithmetic alias
+    // of a saved index; it is evaluated where the Bind appears in the source.
+    PrimExpr result = MakeSymbol(var.dtype(), uniform);
+    symbols_.Set(var, result);
+    return result;
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    bool uniform = true;
+    for (const PrimExpr &offset : op->buffer->ElemOffset(op->indices)) {
+      uniform &= IsUniform(offset);
+    }
+    return MakeSymbol(op->dtype, uniform);
+  }
+
+  PrimExpr AtLaneZero(const PrimExpr &value) const {
+    return SubstituteVar(value, lane_var_.get(), make_zero(lane_var_.dtype()));
+  }
+
+  PrimExpr MakeSymbol(DataType dtype, bool uniform) {
+    if (!IsPtoIndexDType(dtype)) {
+      throw PtoAnalysisError("loaded index values require scalar 8-bit, 16-bit "
+                             "or 32-bit integer elements");
+    }
+    Var symbol("pto_loaded_index", dtype);
+    if (uniform) {
+      return symbol;
+    }
+    // Give the intercept an independent symbol too: the saved value at lane
+    // zero is not zero. Otherwise a product could incorrectly lose a varying
+    // dependence just because the proof substituted lane=0.
+    Var slope("pto_loaded_index_stride", dtype);
+    return symbol + slope * Cast(dtype, lane_var_);
+  }
+
+  Var vector_var_;
+  PrimExpr inverse_index_;
+  Var lane_var_;
+  const Map<Var, PrimExpr> &bind_env_;
+  arith::Analyzer analyzer_;
+  Map<Var, PrimExpr> symbols_;
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> visiting_;
+};
+
+// Indexed addresses are emitted through the ordinary expression converter.
+// Keep its integer arithmetic subset here instead of accepting every pure
+// coordinate node merely because continuous scalar addressing can handle it.
+class IndexedExprCheck : public ExprFunctor<bool(const PrimExpr &)> {
+public:
+  IndexedExprCheck(const Var &vector_var, int64_t lanes,
+                   const Map<Var, PrimExpr> &bind_env, LoadedValueProof &proof)
+      : vector_var_(vector_var), lanes_(lanes), bind_env_(bind_env),
+        proof_(proof) {}
+
+  // Validate the expression and return whether conversion emits a VMI value.
+  // Algebraic uniformity alone does not turn an operation on VMI operands
+  // into a scalar operation.
+  bool RequiresVmi(const PrimExpr &expr) {
+    if (!IsPtoIndexDType(expr.dtype())) {
+      throw PtoAnalysisError("indexed element offsets require scalar 8-bit, "
+                             "16-bit or 32-bit integer expressions");
+    }
+    if (IsPtoScalarCoordinate(expr, vector_var_, bind_env_)) {
+      return false;
+    }
+    return VisitExpr(expr);
+  }
+
+private:
+  bool VisitExpr_(const VarNode *op) final {
+    Var var = GetRef<Var>(op);
+    if (bind_env_.count(var)) {
+      if (visiting_.count(var) || visiting_.size() >= 64) {
+        throw PtoAnalysisError("cyclic or too deep loaded index definition");
+      }
+      visiting_.insert(var);
+      const PrimExpr &value = bind_env_[var];
+      RequiresVmi(value);
+      visiting_.erase(var);
+      return !proof_.IsUniform(value);
+    }
+    return var.same_as(vector_var_);
+  }
+
+  bool VisitExpr_(const BufferLoadNode *op) final {
+    if (!IsOrdinaryUbScope(op->buffer.scope())) {
+      throw PtoAnalysisError(
+          "gather/scatter indices must be loaded from "
+          "ordinary UB buffers; Fragment and GM are unsupported");
+    }
+    if (!IsPtoIndexDType(op->dtype)) {
+      throw PtoAnalysisError("gather/scatter indices must have 8-bit, 16-bit "
+                             "or 32-bit integer elements");
+    }
+    // This load's address is classified separately. Its coordinates are not
+    // values emitted by ConvertExpr (for example, a buffer-version index).
+    return !proof_.IsUniform(GetRef<BufferLoad>(op));
+  }
+
+  bool VisitExpr_(const CastNode *op) final {
+    const bool requires_vmi = RequiresVmi(op->value);
+    CastContext context{requires_vmi ? CastValueKind::kVectorVmi
+                                     : CastValueKind::kScalar,
+                        requires_vmi ? lanes_ : 1};
+    std::string why;
+    if (!PlanValueCast(op, context, &why)) {
+      throw PtoAnalysisError("indexed offset Cast has no supported conversion: " +
+                             why);
+    }
+    return requires_vmi;
+  }
+
+  bool BinaryRequiresVmi(const char *vmi_op, DataType dtype,
+                         const PrimExpr &lhs, const PrimExpr &rhs) {
+    const bool lhs_requires_vmi = RequiresVmi(lhs);
+    const bool rhs_requires_vmi = RequiresVmi(rhs);
+    const bool requires_vmi = lhs_requires_vmi || rhs_requires_vmi;
+    if (requires_vmi && !IsSupportedVectorBinaryOp(vmi_op, dtype)) {
+      std::ostringstream oss;
+      oss << vmi_op << " on " << dtype
+          << " elements is not supported by the VMI operation matrix";
+      throw PtoAnalysisError(oss.str());
+    }
+    return requires_vmi;
+  }
+
+  bool VisitExpr_(const AddNode *op) final {
+    return BinaryRequiresVmi("vadd", op->dtype, op->a, op->b);
+  }
+  bool VisitExpr_(const SubNode *op) final {
+    return BinaryRequiresVmi("vsub", op->dtype, op->a, op->b);
+  }
+  bool VisitExpr_(const MulNode *op) final {
+    return BinaryRequiresVmi("vmul", op->dtype, op->a, op->b);
+  }
+  bool VisitExpr_(const DivNode *op) final {
+    return BinaryRequiresVmi("vdiv", op->dtype, op->a, op->b);
+  }
+
+  bool CheckScalarCoordinate(const PrimExpr &expr, const PrimExpr &lhs,
+                             const PrimExpr &rhs) {
+    if (!proof_.IsUniform(expr)) {
+      return VisitExprDefault_(expr.get());
+    }
+    RequiresVmi(lhs);
+    RequiresVmi(rhs);
+    return false;
+  }
+  bool VisitExpr_(const ModNode *op) final {
+    return CheckScalarCoordinate(GetRef<PrimExpr>(op), op->a, op->b);
+  }
+  bool VisitExpr_(const MinNode *op) final {
+    return CheckScalarCoordinate(GetRef<PrimExpr>(op), op->a, op->b);
+  }
+  bool VisitExpr_(const MaxNode *op) final {
+    return CheckScalarCoordinate(GetRef<PrimExpr>(op), op->a, op->b);
+  }
+  bool VisitExpr_(const SelectNode *op) final {
+    // The address whitelist has already excluded opaque condition calls.
+    return CheckScalarCoordinate(GetRef<PrimExpr>(op), op->true_value,
+                                 op->false_value);
+  }
+  bool VisitExprDefault_(const ffi::Object *op) final {
+    throw PtoAnalysisError(std::string("unsupported indexed offset node ") +
+                           op->GetTypeKey());
+  }
+
+  const Var &vector_var_;
+  int64_t lanes_;
+  const Map<Var, PrimExpr> &bind_env_;
+  LoadedValueProof &proof_;
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> visiting_;
+};
+
+} // namespace
+
+bool IsPtoLaneUniform(const PrimExpr &expr, const Var &vector_var,
+                      const PrimExpr &inverse_index, const Var &lane_var,
+                      const Var &chunk_var, int64_t lanes, int64_t chunk_count,
+                      const ffi::Optional<Var> &kept_var, int64_t kept_extent,
+                      const Map<Var, PrimExpr> &bind_env) {
+  LoadedValueProof proof(vector_var, inverse_index, lane_var, chunk_var, lanes,
+                         chunk_count, kept_var, kept_extent, bind_env);
+  return proof.IsUniform(expr);
+}
+
+void CheckPtoIndexedOffsetExpr(const PrimExpr &offset, const Var &vector_var,
+                               const PtoInverseMapping &mapping,
+                               const Map<Var, PrimExpr> &bind_env) {
+  LoadedValueProof proof(vector_var, mapping.index_expr, mapping.lane_var,
+                         mapping.chunk_var, mapping.lanes, mapping.chunk_count,
+                         mapping.SerialVar(), mapping.SerialExtent(), bind_env);
+  IndexedExprCheck checker(vector_var, mapping.lanes, bind_env, proof);
+  checker.RequiresVmi(offset);
+}
+
+MemoryAccess
+AnalyzePtoAddress(const Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+                  bool is_write, const Var &vector_var,
+                  const PrimExpr &inverse_index, const Var &lane_var,
+                  const Var &chunk_var, int64_t lanes, int64_t chunk_count,
+                  const Optional<Var> &kept_var, int64_t kept_extent,
+                  const Map<Var, PrimExpr> &bind_env) {
+  MemoryAccess result;
+  result.buffer = buffer;
+  result.is_write = is_write;
+
+  ffi::Array<PrimExpr> resolved;
+  for (const PrimExpr &index : indices) {
+    Optional<PrimExpr> alias = ResolveIndexAliases(index, bind_env);
+    if (!alias.defined()) {
+      throw PtoAnalysisError("index Bind alias chain is too deep or cyclic");
+    }
+    if (!IsSupportedAddressExpr(alias.value())) {
+      throw PtoAnalysisError("address expression contains an unsupported "
+                             "call or a non-UB index load");
+    }
+    resolved.push_back(alias.value());
+    PrimExpr inverse =
+        SubstituteVar(alias.value(), vector_var.get(), inverse_index);
+    result.start_indices.push_back(
+        SubstituteVar(inverse, lane_var.get(), make_zero(lane_var.dtype())));
+  }
+  auto offset = [&](const ffi::Array<PrimExpr> &at) {
+    ffi::Array<PrimExpr> offsets = buffer->ElemOffset(at);
+    if (offsets.size() != 1) {
+      throw PtoAnalysisError(
+          "ElemOffset must return exactly one physical axis");
+    }
+    return offsets[0];
+  };
+  result.source_indices = resolved;
+  result.original_offset = offset(resolved);
+
+  LoadedValueProof proof(vector_var, inverse_index, lane_var, chunk_var, lanes,
+                         chunk_count, kept_var, kept_extent, bind_env);
+  result.pattern = proof.Classify(result.original_offset);
+  if (!result.RequiresIndexedInstruction()) {
+    return result;
+  }
+  const DataType dtype = buffer->dtype;
+  const bool byte_integer =
+      dtype.bits() == 8 && (dtype.is_int() || dtype.is_uint());
+  if (dtype.lanes() != 1 ||
+      (!byte_integer && dtype.bits() != 16 && dtype.bits() != 32) ||
+      !(dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
+        dtype.is_bfloat16())) {
+    throw PtoAnalysisError(
+        "indexed gather/scatter requires an int8/uint8, B16 or B32 payload");
+  }
+  if (result.pattern == AccessPattern::kIndexed) {
+    IndexedExprCheck checker(vector_var, lanes, bind_env, proof);
+    checker.RequiresVmi(result.original_offset);
+  }
+  if (dtype.bits() == 32) {
+    return result;
+  }
+
+  ffi::Array<PrimExpr> base_indices;
+  for (size_t axis = 0; axis < resolved.size(); ++axis) {
+    const bool uniform = proof.IsUniform(resolved[axis]);
+    base_indices.push_back(uniform ? resolved[axis]
+                                   : make_zero(resolved[axis].dtype()));
+  }
+  // Keep the same symbolic view metadata in the full offset and base so
+  // subtracting them can cancel the base under either pass's lexical facts.
+  arith::Analyzer expression_analyzer;
+  result.scalar_base_offset =
+      expression_analyzer.Simplify(offset(base_indices));
+  // Buffer metadata participates in the physical address too. Uniform
+  // logical indices do not make a lane-dependent stride/origin a scalar base.
+  if (!proof.IsUniform(result.scalar_base_offset)) {
+    result.scalar_base_offset = make_zero(result.scalar_base_offset.dtype());
+  }
+  return result;
 }
 
 } // namespace pto

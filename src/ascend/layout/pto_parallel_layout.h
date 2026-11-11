@@ -12,8 +12,13 @@
 #ifndef TVM_TL_ASCEND_LAYOUT_PTO_PARALLEL_LAYOUT_H_
 #define TVM_TL_ASCEND_LAYOUT_PTO_PARALLEL_LAYOUT_H_
 
+#include <tvm/arith/analyzer.h>
+#include <tvm/ffi/container/map.h>
+#include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
+
+#include <vector>
 
 #include "layout/layout.h"
 
@@ -35,6 +40,9 @@ namespace pto {
  * \param root       Outermost For of the unit (1D T.Parallel or a two-layer
  *                   Parallel nest).
  * \param lane_bounds Lane range [0, L) of the enclosing SIMD_VF block.
+ * \param active_allocations Allocations active at this unit's lexical position.
+ * \param buffer_versions Physical buffer versions active at this unit.
+ * \param analyzer Lexical scalar facts used to prove offset generation.
  * \return Fragment mapping the unit's input coordinates to lanes and per-lane
  *         chunk positions.
  *
@@ -42,8 +50,11 @@ namespace pto {
  * modified; only the Fragment input extent of the vectorized dimension is
  * padded when the logical extent is not a multiple of L.
  */
-Fragment InferPtoParallelLayout(const tirx::For &root,
-                                const Range &lane_bounds);
+Fragment
+InferPtoParallelLayout(const tirx::For &root, const Range &lane_bounds,
+                       const std::vector<tirx::Buffer> &active_allocations,
+                       const ffi::Map<tirx::Var, int> &buffer_versions,
+                       arith::Analyzer *analyzer);
 
 } // namespace pto
 } // namespace tl

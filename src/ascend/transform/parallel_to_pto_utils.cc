@@ -13,8 +13,11 @@
 
 #include "../../layout/utils.h"
 #include "../../op/utils.h"
+#include "span_utils.h"
 
 #include <functional>
+#include <limits>
+#include <memory>
 #include <sstream>
 
 namespace tvm {
@@ -25,6 +28,23 @@ using namespace tirx;
 using ffi::Array;
 using ffi::GetRef;
 using ffi::Map;
+
+ScopedPtoLoopBounds::ScopedPtoLoopBounds(arith::Analyzer *&analyzer,
+                                         const For &loop)
+    : active_(analyzer), outer_(analyzer), inner_(analyzer->Clone()),
+      constraints_(inner_.get(),
+                   loop->loop_var >= loop->min &&
+                       loop->loop_var < loop->min + loop->extent) {
+  // ConstraintContext alone cannot give the constant-bound analyzer facts
+  // from a symbolic loop minimum or extent. Bind only in that sub-analyzer
+  // so a single-iteration range cannot substitute the loop minimum into
+  // emitted code.
+  inner_->const_int_bound.Bind(loop->loop_var,
+                               Range::FromMinExtent(loop->min, loop->extent));
+  active_ = inner_.get();
+}
+
+ScopedPtoLoopBounds::~ScopedPtoLoopBounds() { active_ = outer_; }
 
 bool IsPtoDirectReduce(const Call &call) {
   return call->op.same_as(Op::Get("tl.tileop.reduce"));
@@ -415,14 +435,12 @@ std::string AccessPatternToString(AccessPattern pattern) {
     return "continuous";
   case AccessPattern::kLaneUniform:
     return "lane-uniform";
+  case AccessPattern::kIndexed:
+    return "indexed";
   default:
     return "unknown";
   }
 }
-
-// SubstituteVar, ResolveIndexAliases and IsSupportedAddressExpr live in
-// pto_index_analysis.cc; PTO lane-layout planning and the consumers here share
-// that single implementation.
 
 PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   auto anno = loop->annotations.Get(attr::kPtoParallelLoopLayout);
@@ -472,7 +490,8 @@ PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
         "pto_parallel_loop_layout requires replicate_size == 1");
   }
 
-  const int64_t *lanes_ptr = as_const_int(fragment->ThreadExtent());
+  PrimExpr thread_extent = fragment->ThreadExtent();
+  const int64_t *lanes_ptr = as_const_int(thread_extent);
   if (lanes_ptr == nullptr || *lanes_ptr <= 0) {
     throw PtoAnalysisError(
         "pto_parallel_loop_layout thread extent must be a positive constant");
@@ -759,154 +778,730 @@ PtoInverseMapping InvertPtoLaneLayout(const For &loop) {
   return mapping;
 }
 
+namespace {
+
+[[noreturn]] void Fail(const std::string &message, const Span &span) {
+  throw PtoAnalysisError(message + SpanHintSuffix(span));
+}
+
+} // namespace
+
+// A value can be widened to signed 64-bit without changing its value for every
+// signed integer and for unsigned integers narrower than 64 bits.  An unsigned
+// 64-bit value is safe only when its range is proven finite; otherwise the
+// widening cast could reinterpret values above INT64_MAX.
+bool RepresentableInInt64(arith::Analyzer *analyzer, const PrimExpr &value) {
+  const DataType dtype = value.dtype();
+  if (!dtype.is_uint() || dtype.bits() < 64) {
+    return true;
+  }
+  return analyzer->const_int_bound(value)->max_value !=
+         arith::ConstIntBound::kPosInf;
+}
+
+PrimExpr WidenToInt64(const PrimExpr &value) {
+  if (value.dtype().is_int() && value.dtype().bits() == 64) {
+    return value;
+  }
+  return Cast(DataType::Int(64), value);
+}
+
+void ValidateUbBuffer(const Buffer &buffer, const std::string &op_name,
+                      const Span &span) {
+  String scope = buffer.scope();
+  if (!IsOrdinaryUbScope(scope)) {
+    Fail(op_name + " requires a UB pointer, got buffer scope '" +
+             std::string(scope.c_str(), scope.size()) + "'",
+         span);
+  }
+  if (!buffer->axis_separators.empty()) {
+    Fail(op_name +
+             " requires a single scalar linear buffer address, but buffer '" +
+             std::string(buffer->name.c_str(), buffer->name.size()) +
+             "' declares axis separators",
+         span);
+  }
+}
+
+Array<PrimExpr> BufferZeros(const Buffer &buffer) {
+  DataType dtype =
+      buffer->shape.empty() ? DataType::Int(32) : buffer->shape[0].dtype();
+  Array<PrimExpr> starts;
+  for (size_t i = 0; i < buffer->shape.size(); ++i) {
+    starts.push_back(IntImm(dtype, 0));
+  }
+  return starts;
+}
+
+std::string BufferContext(const Buffer &buffer) {
+  std::ostringstream oss;
+  oss << "buffer '" << buffer->name << "': shape=[";
+  for (size_t i = 0; i < buffer->shape.size(); ++i) {
+    if (i != 0) {
+      oss << ", ";
+    }
+    oss << buffer->shape[i];
+  }
+  oss << "]";
+  if (!buffer->strides.empty()) {
+    oss << ", strides=[";
+    for (size_t i = 0; i < buffer->strides.size(); ++i) {
+      if (i != 0) {
+        oss << ", ";
+      }
+      oss << buffer->strides[i];
+    }
+    oss << "]";
+  }
+  oss << ", elem_offset=" << buffer->elem_offset;
+  return oss.str();
+}
+
+PrimExpr MakeDescriptor(const Buffer &buffer, const Array<PrimExpr> &starts,
+                        const PrimExpr &extent, int rw_mask) {
+  return Call(
+      DataType::Handle(), tl::access_ptr(),
+      {BufferLoad(buffer, starts), extent, IntImm(DataType::Int(32), rw_mask)});
+}
+
+Buffer FindAllocationOwner(const std::vector<Buffer> &active_allocations,
+                           const Buffer &source, const std::string &op_name,
+                           const Span &span) {
+  std::optional<Buffer> owner;
+  for (const Buffer &buffer : active_allocations) {
+    if (!buffer->data.same_as(source->data)) {
+      continue;
+    }
+    if (!owner.has_value()) {
+      owner = buffer;
+    } else if (!owner->same_as(buffer)) {
+      Fail(op_name +
+               " found multiple active allocations sharing the source data; "
+               "the owner is ambiguous, and different allocation objects are "
+               "never merged by data pointer",
+           span);
+    }
+  }
+  if (!owner.has_value()) {
+    Fail(op_name +
+             " requires a unique local allocation that is active at this "
+             "position and owns the source data; no active allocation was "
+             "found (a parameter, view, or full-function collection table is "
+             "not an owner)",
+         span);
+  }
+  return owner.value();
+}
+
+bool StableIndexedAddressNode(const ObjectRef &node) {
+  return node.as<VarNode>() || node.as<IntImmNode>() || node.as<CastNode>() ||
+         node.as<AddNode>() || node.as<SubNode>() || node.as<MulNode>() ||
+         node.as<FloorDivNode>() || node.as<FloorModNode>() ||
+         node.as<MinNode>() || node.as<MaxNode>();
+}
+
+// One traversal for the checks shared by address and capacity snapshots.
+// Each caller supplies its own admission set and keeps its own diagnostics;
+// sharing the walk must not merge those sets.  Post-order reaches a read or a
+// call only after its arguments, so collect the whole expression and let the
+// caller give reads and calls priority over an incidental leaf type from
+// inside them.  This pass conservatively rejects every direct Call in these
+// snapshots, including a pure call; it does not classify whether a particular
+// pure call would be evaluable at the use point.
+ExpressionStabilityScan
+ScanExpressionStability(const PrimExpr &expr,
+                        bool (*is_stable)(const ObjectRef &)) {
+  ExpressionStabilityScan scan;
+  PostOrderVisit(expr, [&](const ObjectRef &node) {
+    scan.has_load = scan.has_load || node.as<BufferLoadNode>() != nullptr;
+    scan.has_call = scan.has_call || node.as<CallNode>() != nullptr;
+    if (scan.first_unstable_type.empty() && !is_stable(node)) {
+      scan.first_unstable_type = node->GetTypeKey();
+    }
+  });
+  return scan;
+}
+
+namespace {
+
+// The address snapshot whitelist above is deliberately narrow because it
+// feeds bound-pointer reconstruction.  An owner capacity only needs a stable
+// scalar expression that can be evaluated at the use point, so it also admits
+// truncating div/mod, comparisons, boolean combinations, and Select.  Keep
+// this classification local: extending it must not relax address admission.
+bool StableOwnerCapacityNode(const ObjectRef &node) {
+  return StableIndexedAddressNode(node) || node.as<DivNode>() ||
+         node.as<ModNode>() || node.as<SelectNode>() || node.as<EQNode>() ||
+         node.as<NENode>() || node.as<LTNode>() || node.as<LENode>() ||
+         node.as<GTNode>() || node.as<GENode>() || node.as<AndNode>() ||
+         node.as<OrNode>() || node.as<NotNode>();
+}
+
+// Inspect the allocation shape nodes before Analyzer simplification.
+// A shape such as `read * 0 + 64` folds
+// to a constant, but the physical capacity was still fixed by a mutable read
+// at allocation time; the use-point extent must not re-evaluate that read.
+// A Var is a snapshot leaf: its definition is deliberately not followed, so a
+// scalar saved before the allocation remains a stable capacity even when the
+// memory behind it changes later.
+std::optional<std::string> OwnerCapacityStabilityReason(const Buffer &owner) {
+  for (size_t dim = 0; dim < owner->shape.size(); ++dim) {
+    const PrimExpr &shape = owner->shape[dim];
+    ExpressionStabilityScan scan =
+        ScanExpressionStability(shape, StableOwnerCapacityNode);
+    std::string reason;
+    if (scan.has_load) {
+      reason = "the shape re-reads a buffer at the use point; save the shape "
+               "value in a scalar Var before allocating the owner";
+    } else if (scan.has_call) {
+      reason =
+          "the shape executes a call at the use point; save the shape value "
+          "in a scalar Var before allocating the owner";
+    } else if (!scan.first_unstable_type.empty()) {
+      std::ostringstream oss;
+      oss << "the shape contains a non-stable node of type "
+          << scan.first_unstable_type
+          << "; save the shape value in a scalar Var before allocating the "
+             "owner";
+      reason = oss.str();
+    }
+    if (!reason.empty()) {
+      std::ostringstream oss;
+      oss << "owner capacity is not a stable snapshot: shape dimension " << dim
+          << " (length " << shape << ", " << BufferContext(owner)
+          << ") cannot be rebuilt at the use point: " << reason;
+      return oss.str();
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> OwnerTightReason(arith::Analyzer *analyzer,
+                                            const Buffer &owner) {
+  size_t ndim = owner->shape.size();
+  if (ndim == 0) {
+    return std::string("the owner has no dimensions");
+  }
+  if (owner->strides.empty()) {
+    return std::nullopt;
+  }
+  if (owner->strides.size() != ndim) {
+    return std::string("the owner stride rank ") +
+           std::to_string(owner->strides.size()) + " does not match its rank " +
+           std::to_string(ndim);
+  }
+  // Compute the expected tight strides from the inner shape dimensions in a
+  // value-preserving int64 domain.  Multiplying in the shape dtype wraps: for
+  // shape (2, 67108865, 64) the int32 product 67108865 * 64 becomes 64, which
+  // would accept an overlapping stride[0]=64 and reject the mathematically
+  // tight stride[0]=4294967360.  The layout contract itself is unchanged.
+  PrimExpr expected = IntImm(DataType::Int(64), 1);
+  for (size_t dim = ndim; dim-- > 0;) {
+    const PrimExpr &stride = owner->strides[dim];
+    if (!RepresentableInInt64(analyzer, stride)) {
+      std::ostringstream oss;
+      oss << "the owner layout is not provably tight row-major: stride[" << dim
+          << "]=" << stride
+          << " has an unsigned 64-bit range that cannot be compared without "
+             "losing integer precision";
+      return oss.str();
+    }
+    if (!analyzer->CanProveEqual(WidenToInt64(stride), expected)) {
+      std::ostringstream oss;
+      oss << "the owner layout is not provably tight row-major: stride[" << dim
+          << "]=" << stride << " does not equal the expected " << expected;
+      return oss.str();
+    }
+    if (dim > 0) {
+      const PrimExpr &factor = owner->shape[dim];
+      if (!RepresentableInInt64(analyzer, factor)) {
+        std::ostringstream oss;
+        oss << "the owner layout is not provably tight row-major: dimension "
+            << dim << " has an unsigned 64-bit length that cannot be widened "
+            << "without losing integer precision";
+        return oss.str();
+      }
+      __int128 product_bound =
+          static_cast<__int128>(
+              analyzer->const_int_bound(expected)->max_value) *
+          static_cast<__int128>(analyzer->const_int_bound(factor)->max_value);
+      if (product_bound > std::numeric_limits<int64_t>::max()) {
+        std::ostringstream oss;
+        oss << "the owner layout is not provably tight row-major within the "
+               "signed 64-bit range: the expected stride outside dimension "
+            << dim - 1 << " is the product of dimensions " << dim << ".."
+            << ndim - 1 << ", whose upper bound exceeds int64";
+        return oss.str();
+      }
+      expected = analyzer->Simplify(expected * WidenToInt64(factor));
+    }
+  }
+  return std::nullopt;
+}
+
+PrimExpr DescribeOwnerExtent(const Buffer &owner) {
+  // Multiply in int64 without changing the dtype of arithmetic inside each
+  // shape expression. Keep allocation-time Vars in the descriptor.
+  PrimExpr extent = IntImm(DataType::Int(64), 1);
+  for (const PrimExpr &shape : owner->shape) {
+    extent = extent * WidenToInt64(shape);
+  }
+  arith::Analyzer expression_analyzer;
+  return expression_analyzer.Simplify(extent);
+}
+
+PrimExpr CheckOwnerCapacity(arith::Analyzer *analyzer, const Buffer &owner,
+                            const std::string &op_name, const Span &span) {
+  // Upper bound of the mathematical shape product, computed without ever
+  // evaluating the product in the shape dtype.  `unbounded` counts symbolic
+  // factors whose ConstIntBound has no finite maximum.
+  int64_t max_extent = 1;
+  int unbounded = 0;
+  bool unbounded_uint = false;
+
+  auto capacity_failure = [&](const std::string &detail) {
+    Fail(op_name +
+             " cannot represent the whole-owner element capacity as a stable "
+             "descriptor extent: " +
+             detail,
+         span);
+  };
+
+  for (size_t dim = 0; dim < owner->shape.size(); ++dim) {
+    const PrimExpr &shape = owner->shape[dim];
+    const int64_t *length = as_const_int(shape);
+    int64_t factor_bound = 1;
+    if (length && !shape.dtype().is_bool()) {
+      if (*length <= 0) {
+        Fail(op_name + " owner dimension " + std::to_string(dim) +
+                 " has non-positive length " + std::to_string(*length),
+             span);
+      }
+      factor_bound = *length;
+    } else {
+      if (!analyzer->CanProve(shape > 0)) {
+        Fail(op_name + " cannot prove owner dimension " + std::to_string(dim) +
+                 " is positive",
+             span);
+      }
+      if (!analyzer->CanProveEqual(shape, make_const(shape.dtype(), 1))) {
+        arith::ConstIntBound bound = analyzer->const_int_bound(shape);
+        if (bound->max_value == arith::ConstIntBound::kPosInf) {
+          ++unbounded;
+          unbounded_uint = unbounded_uint || shape.dtype().is_uint();
+        } else {
+          if (bound->max_value <= 0) {
+            capacity_failure("dimension " + std::to_string(dim) +
+                             " has no positive upper bound");
+          }
+          factor_bound = bound->max_value;
+        }
+      }
+    }
+    if (factor_bound > 1) {
+      __int128 next = static_cast<__int128>(max_extent) * factor_bound;
+      if (next > std::numeric_limits<int64_t>::max()) {
+        capacity_failure("the shape product overflows int64");
+      }
+      max_extent = static_cast<int64_t>(next);
+    }
+  }
+  if (unbounded > 0) {
+    // A single unbounded factor is representable only when every other factor
+    // is one: the capacity then is that factor itself, not a wider product.
+    if (unbounded > 1 || max_extent > 1 || unbounded_uint) {
+      capacity_failure(
+          "a symbolic owner dimension has no finite upper bound, so the shape "
+          "product cannot be proven representable in int64");
+    }
+  }
+
+  // Check the mathematical product before simplifying in finite-width TIR.
+  PrimExpr extent = DescribeOwnerExtent(owner);
+  if (!analyzer->CanProve(extent > 0)) {
+    Fail(op_name +
+             " cannot prove the whole-owner element capacity is positive; the "
+             "owner shape product is not a stable capacity proof",
+         span);
+  }
+  return extent;
+}
+
+} // namespace
+
+IndexedMemoryOwner CheckIndexedAllocationStorage(arith::Analyzer *analyzer,
+                                                 const Buffer &owner,
+                                                 const std::string &op_name,
+                                                 const Span &span) {
+  // Capacity stability is an owner property and must be checked before any
+  // Analyzer folding, coverage, or extent construction can rewrite the shape.
+  if (std::optional<std::string> stability =
+          OwnerCapacityStabilityReason(owner)) {
+    Fail(op_name + " " + stability.value(), span);
+  }
+  ValidateUbBuffer(owner, op_name + " owner", span);
+  if (std::optional<std::string> tight = OwnerTightReason(analyzer, owner)) {
+    Fail(op_name + " owner is not usable: " + tight.value(), span);
+  }
+  PrimExpr origin = owner.OffsetOf(BufferZeros(owner))[0];
+  if (!analyzer->CanProveEqual(origin, make_zero(origin.dtype()))) {
+    std::ostringstream oss;
+    oss << op_name << " owner origin must be provably zero, but elem_offset "
+        << origin << " (" << BufferContext(owner)
+        << ") is not provably zero";
+    Fail(oss.str(), span);
+  }
+  return {owner, origin, CheckOwnerCapacity(analyzer, owner, op_name, span)};
+}
+
+PrimExpr CheckIndexedTypedViewExtent(arith::Analyzer *analyzer,
+                                     const Buffer &view,
+                                     const std::string &op_name,
+                                     const Span &span) {
+  if (auto stability = OwnerCapacityStabilityReason(view)) {
+    Fail(op_name + " dtype-changing view " + stability.value(), span);
+  }
+  if (auto tight = OwnerTightReason(analyzer, view)) {
+    Fail(op_name + " dtype-changing view is not usable: " + tight.value(),
+         span);
+  }
+  return CheckOwnerCapacity(analyzer, view, op_name, span);
+}
+
+IndexedMemoryOwner CheckIndexedMemoryOwner(const Buffer &source,
+                                           const Buffer &owner,
+                                           arith::Analyzer *analyzer,
+                                           const std::string &context,
+                                           const Span &span) {
+  ValidateUbBuffer(source, context + " source", span);
+  if (source->dtype != owner->dtype) {
+    std::ostringstream oss;
+    oss << context << " requires the source element dtype " << source->dtype
+        << " to match the owner element dtype " << owner->dtype;
+    Fail(oss.str(), span);
+  }
+  return CheckIndexedAllocationStorage(analyzer, owner, context, span);
+}
+
+IndexedMemoryOwner DescribeIndexedMemoryOwner(const Buffer &owner) {
+  return {owner, owner.OffsetOf(BufferZeros(owner))[0],
+          DescribeOwnerExtent(owner)};
+}
+
+PrimExpr MakeIndexedMemoryDescriptor(const IndexedMemoryOwner &owner,
+                                     bool is_write,
+                                     const Optional<PrimExpr> &version,
+                                     const Optional<PrimExpr> &extent) {
+  Array<PrimExpr> starts = BufferZeros(owner.buffer);
+  if (version) {
+    starts.Set(0, version.value());
+  }
+  return MakeDescriptor(owner.buffer, starts, extent.value_or(owner.extent),
+                        is_write ? 2 : 1);
+}
+
 MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  const Array<PrimExpr> &indices, bool is_write,
                                  const Var &loop_var,
                                  const PtoInverseMapping &mapping,
-                                 arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env) {
-  MemoryAccess access;
-  access.buffer = buffer;
-  access.elem_dtype = buffer->dtype;
-  access.is_write = is_write;
+  return AnalyzePtoAddress(
+      buffer, indices, is_write, loop_var, mapping.index_expr, mapping.lane_var,
+      mapping.chunk_var, mapping.lanes, mapping.chunk_count,
+      mapping.SerialVar(), mapping.SerialExtent(), bind_env);
+}
 
-  // Resolve Bind aliases in the indices first: a bound index var
-  // must follow its definition, not be treated as lane-independent. The
-  // resolver rejects chains that exceed the limit instead of silently
-  // stopping.
-  //
-  // Only *pure coordinate* aliases (loop vars, arithmetic over
-  // loop vars/consts) may be expanded. A Bind whose definition contains a
-  // BufferLoad holds an SSA value: re-expanding it into a memory read can
-  // cross a same-point store and wrongly cancel (the loaded value and the
-  // current buffer state differ). Addresses that depend on loaded values
-  // have no supported lowering and are rejected here.
-  Array<PrimExpr> resolved;
-  for (const auto &idx : indices) {
-    auto opt = ResolveIndexAliases(idx, bind_env);
-    if (!opt.has_value()) {
-      std::ostringstream oss;
-      oss << "buffer `" << buffer->name
-          << "`: bind alias chain in index is too deep, cyclic, or "
-             "depends on a loaded value (data-dependent addresses are "
-             "not yet supported)";
-      throw PtoAnalysisError(oss.str());
+namespace {
+
+// ElemOffset may promote a native index to the buffer shape dtype. Stop at
+// the source expression so an explicit cast still determines the offset.
+PrimExpr StripIndexWidening(const MemoryAccess &access,
+                           const PrimExpr &relative) {
+  PrimExpr native = relative;
+  while (true) {
+    const DataType dtype = native.dtype();
+    for (const PrimExpr &index : access.source_indices) {
+      if (ExprDeepEqual()(native, index)) {
+        return dtype.bits() == 8 || dtype.bits() == 16 ? native : relative;
+      }
     }
-    resolved.push_back(opt.value());
+    const auto *conversion = native.as<CastNode>();
+    if (!conversion) {
+      break;
+    }
+    const DataType from = conversion->value.dtype();
+    const DataType to = conversion->dtype;
+    if (!(from.is_int() || from.is_uint()) || !(to.is_int() || to.is_uint()) ||
+        from.bits() >= to.bits() || !conversion->annotations.empty()) {
+      break;
+    }
+    native = conversion->value;
   }
-  // Address expressions must only contain supported
-  // nodes; opaque calls in addresses have no lowering rule and would be
-  // silently collapsed to one evaluation per chunk.
-  for (const auto &idx : resolved) {
-    if (!IsSupportedAddressExpr(idx)) {
-      std::ostringstream oss;
-      oss << "buffer `" << buffer->name
-          << "`: address expression contains a loaded value or an "
-             "unsupported call (loaded values and opaque/extern calls "
-             "cannot appear in addresses; they would be evaluated once per "
-             "chunk instead of per element)";
-      throw PtoAnalysisError(oss.str());
+  return relative;
+}
+
+// Only coordinates and their integer arithmetic can be generated at a narrower
+// width without converting an already loaded vector. Check every intermediate
+// on active iterations. Tail offsets are sanitized before indexed memory
+// operations, so integer wrap in an inactive lane cannot affect an access.
+bool CanGenerateUint16Offsets(const PrimExpr &offset, const Var &loop_var,
+                              const PtoInverseMapping &mapping,
+                              arith::Analyzer *analyzer) {
+  std::unique_ptr<arith::Analyzer> proof = analyzer->Clone();
+  proof->Bind(loop_var, Range::FromMinExtent(
+                            make_zero(loop_var.dtype()),
+                            IntImm(loop_var.dtype(), mapping.logical_extent)));
+  if (auto serial = mapping.SerialVar()) {
+    const Var &serial_var = serial.value();
+    proof->Bind(serial_var,
+                Range::FromMinExtent(
+                    make_zero(serial_var.dtype()),
+                    IntImm(serial_var.dtype(), mapping.SerialExtent())));
+  }
+  std::function<bool(const PrimExpr &)> check = [&](const PrimExpr &expr) {
+    if (expr.dtype() != DataType::Int(32) &&
+        expr.dtype() != DataType::UInt(32)) {
+      return false;
+    }
+    if (const auto *add = expr.as<AddNode>()) {
+      if (!check(add->a) || !check(add->b)) {
+        return false;
+      }
+    } else if (const auto *sub = expr.as<SubNode>()) {
+      if (!check(sub->a) || !check(sub->b)) {
+        return false;
+      }
+    } else if (const auto *mul = expr.as<MulNode>()) {
+      if (!check(mul->a) || !check(mul->b)) {
+        return false;
+      }
+    } else if (!expr.as<IntImmNode>() && !expr.as<VarNode>()) {
+      return false;
+    }
+    arith::ConstIntBound bound = proof->const_int_bound(expr);
+    return bound->min_value >= 0 && bound->max_value <= 65535;
+  };
+  return check(offset);
+}
+
+bool HasLeadingVersionAxis(const Buffer &buffer, int versions,
+                           arith::Analyzer *analyzer) {
+  return buffer->shape.size() > 1 &&
+         analyzer->CanProveEqual(buffer->shape[0], versions);
+}
+
+void CheckPtoVersionSlotView(const Buffer &view, const Array<PrimExpr> &strides,
+                             const PrimExpr &origin,
+                             const PrimExpr &slot_extent,
+                             arith::Analyzer *analyzer) {
+  // Bound the whole trailing view because an active offset can come from a
+  // loaded index. Check each product against the remaining space before
+  // forming it, so a large extent or stride cannot wrap the proof.
+  PrimExpr one = make_const(slot_extent.dtype(), 1);
+  PrimExpr remaining = slot_extent - origin - one;
+  for (size_t axis = 1; axis < view->shape.size(); ++axis) {
+    PrimExpr extent = cast(slot_extent.dtype(), view->shape[axis]);
+    PrimExpr stride = cast(slot_extent.dtype(), strides[axis]);
+    if (analyzer->CanProveEqual(stride, 0)) {
+      continue;
+    }
+    if (!analyzer->CanProve(extent > 0) || !analyzer->CanProve(stride >= 0) ||
+        !analyzer->CanProve(extent - one <=
+                            floordiv(remaining, Max(stride, one)))) {
+      throw PtoAnalysisError("indexed access to padded versioned storage "
+                             "requires the view to fit in a single version slot");
+    }
+    remaining = analyzer->Simplify(remaining - (extent - one) * stride);
+  }
+}
+
+} // namespace
+
+PtoIndexedAccessPlan PlanPtoIndexedAccess(const MemoryAccess &access,
+                                          const IndexedMemoryOwner &owner,
+                                          const Var &loop_var,
+                                          const PtoInverseMapping &mapping,
+                                          arith::Analyzer *analyzer,
+                                          const Map<Var, int> &buffer_versions,
+                                          const Map<Var, PrimExpr> &bind_env) {
+  PrimExpr original_offset = access.original_offset;
+  PrimExpr scalar_base = access.scalar_base_offset;
+  PtoIndexedAccessPlan plan;
+  plan.base = make_zero(DataType::Int(32));
+  plan.descriptor_extent = owner.extent;
+  auto versions = buffer_versions.Get(owner.buffer->data);
+  if (versions && *versions > 1 &&
+      HasLeadingVersionAxis(owner.buffer, *versions, analyzer)) {
+    arith::Analyzer expr_analyzer;
+    PrimExpr slot_extent = expr_analyzer.Simplify(floordiv(owner.extent, *versions));
+    int elements_per_alignment = 256 / owner.buffer->dtype.bits();
+    const bool padded = !analyzer->CanProveEqual(
+        floormod(slot_extent, elements_per_alignment), 0);
+    // A scheduler-added version selector can be placed in the pointer even
+    // when slots are already aligned. Keep a native narrow index intact.
+    bool use_aligned_slot = false;
+    if (!padded && access.buffer.same_as(owner.buffer) &&
+        access.buffer->dtype.bits() <= 16) {
+      Array<PrimExpr> slot_indices = access.source_indices;
+      slot_indices.Set(0, make_zero(slot_indices[0].dtype()));
+      PrimExpr offset = StripIndexWidening(
+          access, access.buffer->ElemOffset(slot_indices)[0]);
+      use_aligned_slot =
+          offset.dtype().bits() <= 16 &&
+          IsPtoLaneUniform(access.source_indices[0], loop_var, mapping.index_expr,
+                           mapping.lane_var, mapping.chunk_var, mapping.lanes,
+                           mapping.chunk_count, mapping.SerialVar(),
+                           mapping.SerialExtent(), bind_env);
+    }
+    if (padded || use_aligned_slot) {
+      // RewriteAscendBufferVersionLayout realigns the descriptor's scalar
+      // pointer. Vector offsets must stay within that selected slot.
+      Array<PrimExpr> strides = PtoBufferStrides(access.buffer, analyzer);
+      if (!HasLeadingVersionAxis(access.buffer, *versions, analyzer) ||
+          !analyzer->CanProveEqual(
+              cast(slot_extent.dtype(), strides[0]),
+              slot_extent)) {
+        throw PtoAnalysisError("indexed access to padded versioned storage "
+                               "requires a leading version axis");
+      }
+      const PrimExpr &version = access.source_indices[0];
+      const auto serial = mapping.SerialVar();
+      const int64_t serial_extent = mapping.SerialExtent();
+      if (!IsPtoLaneUniform(version, loop_var, mapping.index_expr,
+                            mapping.lane_var, mapping.chunk_var, mapping.lanes,
+                            mapping.chunk_count, serial, serial_extent,
+                            bind_env)) {
+        throw PtoAnalysisError("indexed access to padded versioned storage "
+                               "requires a lane-uniform version selector");
+      }
+
+      // A static view origin can move the first logical row to a later slot.
+      // Apply that shift to the descriptor, where version alignment is handled.
+      const PrimExpr &view_origin = access.buffer->elem_offset;
+      const int64_t *origin = as_const_int(view_origin);
+      if (origin == nullptr || *origin < 0) {
+        throw PtoAnalysisError("indexed access to padded versioned storage "
+                               "requires a constant non-negative view origin");
+      }
+      PrimExpr wide_origin = make_const(slot_extent.dtype(), *origin);
+      PrimExpr slot_shift = expr_analyzer.Simplify(floordiv(wide_origin, slot_extent));
+      PrimExpr within_slot = expr_analyzer.Simplify(floormod(wide_origin, slot_extent));
+      CheckPtoVersionSlotView(access.buffer, strides, within_slot, slot_extent,
+                              analyzer);
+
+      plan.version_index = version;
+      Buffer slot_view = access.buffer;
+      if (!is_zero(slot_shift)) {
+        PrimExpr shifted_version =
+            expr_analyzer.Simplify(cast(slot_extent.dtype(), version) + slot_shift);
+        auto proof = analyzer->Clone();
+        proof->Bind(loop_var, Range::FromMinExtent(
+                                  make_zero(loop_var.dtype()),
+                                  IntImm(loop_var.dtype(), mapping.logical_extent)));
+        if (serial) {
+          const Var &serial_var = serial.value();
+          proof->Bind(serial_var,
+                      Range::FromMinExtent(
+                          make_zero(serial_var.dtype()),
+                          IntImm(serial_var.dtype(), serial_extent)));
+        }
+        if (!proof->CanProve(shifted_version >= 0) ||
+            !proof->CanProve(shifted_version < *versions)) {
+          throw PtoAnalysisError("indexed view selects a version outside "
+                                 "the padded allocation");
+        }
+        plan.version_index = shifted_version;
+        slot_view.CopyOnWrite()->elem_offset = cast(view_origin.dtype(), within_slot);
+      }
+      Array<PrimExpr> slot_indices = access.source_indices;
+      slot_indices.Set(0, make_zero(version.dtype()));
+      original_offset = slot_view->ElemOffset(slot_indices)[0];
+      if (scalar_base.defined() && !is_zero(scalar_base)) {
+        scalar_base = expr_analyzer.Simplify(
+            scalar_base - version * strides[0] -
+            (view_origin - slot_view->elem_offset));
+      }
+      plan.descriptor_extent = slot_extent;
     }
   }
-
-  // indices_after_inverse: substitute loop_var with the inverse mapping's
-  // own expression (mapping.index_expr — the single source of truth; do
-  // not rebuild chunk * L + lane here).
-  Array<PrimExpr> indices_after_inverse;
-  for (const auto &idx : resolved) {
-    indices_after_inverse.push_back(analyzer->Simplify(
-        SubstituteVar(idx, loop_var.get(), mapping.index_expr)));
+  plan.offsets = StripIndexWidening(access, original_offset);
+  const int offset_bits = access.buffer->dtype.bits() == 32 ? 32 : 16;
+  auto can_generate_offsets = [&] {
+    if (plan.offsets.dtype().bits() <= offset_bits) {
+      return true;
+    }
+    plan.generate_uint16_offsets =
+        offset_bits == 16 &&
+        CanGenerateUint16Offsets(plan.offsets, loop_var, mapping, analyzer);
+    return plan.generate_uint16_offsets;
+  };
+  if (can_generate_offsets()) {
+    return plan;
   }
-  access.indices_after_inverse = indices_after_inverse;
-
-  // start_indices: bind lane = 0.
-  Array<PrimExpr> start_indices;
-  for (const auto &idx : indices_after_inverse) {
-    start_indices.push_back(analyzer->Simplify(
-        SubstituteVar(idx, mapping.lane_var.get(), make_zero(idx.dtype()))));
+  if (offset_bits == 16 && !analyzer->CanProve(plan.descriptor_extent <= 65536)) {
+    plan.rebased = true;
+    plan.base = scalar_base;
+    // Prove the range of the actual relative offsets. The logical view can
+    // cover more elements than its native index type can address.
+    arith::Analyzer expression_analyzer;
+    plan.offsets = StripIndexWidening(
+        access,
+        expression_analyzer.Simplify(original_offset - plan.base));
+    if (can_generate_offsets()) {
+      return plan;
+    }
   }
-  access.start_indices = start_indices;
+  std::ostringstream oss;
+  if (plan.rebased) {
+    oss << "B16 indexed access requires a ui16 relative window: ";
+  }
+  oss << "indexed " << plan.offsets.dtype().bits()
+      << "-bit offsets require implicit narrowing to " << offset_bits
+      << " bits; use a native 16-bit index or an explicit source Cast only "
+         "after ensuring the complete element offset is representable";
+  throw PtoAnalysisError(oss.str());
+}
 
-  // data_offset via ElemOffset (handles strides / elem_offset / versions).
-  Array<PrimExpr> elem_offsets = buffer->ElemOffset(indices_after_inverse);
-  if (elem_offsets.size() != 1) {
+void CheckPtoIndexedAccessPlan(const PtoIndexedAccessPlan &plan,
+                               const Var &loop_var,
+                               const PtoInverseMapping &mapping,
+                               arith::Analyzer *analyzer,
+                               const Map<Var, PrimExpr> &bind_env) {
+  if (!IsSupportedAddressExpr(plan.offsets)) {
+    throw PtoAnalysisError(
+        "complete indexed offset contains an unsupported call or a non-UB "
+        "index load");
+  }
+  if (!plan.generate_uint16_offsets) {
+    CheckPtoIndexedOffsetExpr(plan.offsets, loop_var, mapping, bind_env);
+  }
+  if (!plan.rebased) {
+    return;
+  }
+  std::unique_ptr<arith::Analyzer> proof = analyzer->Clone();
+  proof->Bind(mapping.chunk_var,
+              Range::FromMinExtent(
+                  make_zero(mapping.chunk_var.dtype()),
+                  IntImm(mapping.chunk_var.dtype(), mapping.chunk_count)));
+  if (auto serial = mapping.SerialVar()) {
+    const Var &serial_var = serial.value();
+    proof->Bind(serial_var,
+                Range::FromMinExtent(
+                    make_zero(serial_var.dtype()),
+                    IntImm(serial_var.dtype(), mapping.SerialExtent())));
+  }
+  PrimExpr base = SubstituteVar(plan.base, loop_var.get(), mapping.index_expr);
+  base = proof->Simplify(SubstituteVar(base, mapping.lane_var.get(),
+                                       make_zero(mapping.lane_var.dtype())));
+  if (!proof->CanProve(base >= 0) ||
+      !proof->CanProve(base < plan.descriptor_extent)) {
     std::ostringstream oss;
-    oss << "buffer `" << buffer->name
-        << "`: ElemOffset must return exactly one physical axis, got "
-        << elem_offsets.size();
+    oss << "B16 indexed access requires the scalar instruction base D to be "
+           "provably inside the owner (0 <= D < "
+        << plan.descriptor_extent << "), but the rebased access produces base "
+        << base;
     throw PtoAnalysisError(oss.str());
   }
-  access.data_offset = analyzer->Simplify(elem_offsets[0]);
-
-  Array<PrimExpr> start_elem_offsets = buffer->ElemOffset(start_indices);
-  ICHECK_EQ(start_elem_offsets.size(), 1u);
-  access.start_offset = analyzer->Simplify(start_elem_offsets[0]);
-
-  // Classify with a *complete* proof: continuous means
-  // data_offset == start_offset + lane over the whole [0, L) lane range,
-  // not a two-point difference. Bind the ranges and require the analyzer
-  // to prove the identity; anything it cannot prove is rejected.
-  // The lane-uniform check shares this range-bound proof
-  // analyzer — with an unbound analyzer a chunk-uniform address such as
-  // (i // L) * L cannot be proven equal to its lane=0 substitution (the
-  // proof needs 0 <= lane < L), so legal inputs were mis-rejected.
-  arith::Analyzer proof;
-  proof.Bind(
-      mapping.lane_var,
-      Range::FromMinExtent(make_zero(mapping.lane_var->dtype),
-                           IntImm(mapping.lane_var->dtype, mapping.lanes)));
-  // The chunk proof domain is the per-row padded chunk range
-  // [0, Q) with Q = P / L on the vectorized dimension — for a 2D unit the
-  // *in-row* chunk count, never the global position K*Q (the global
-  // flattened position only appears in the Fragment forward/inverse
-  // layout checks, not in address proofs).
-  proof.Bind(mapping.chunk_var,
-             Range::FromMinExtent(
-                 make_zero(mapping.chunk_var->dtype),
-                 IntImm(mapping.chunk_var->dtype, mapping.chunk_count)));
-  // In a 2D unit the kept coordinate is bounded by its own loop
-  // extent — a fact the layout candidate already uses when it accepts
-  // the unit. Binding it here keeps the final proof domain
-  // identical to the candidate's, so range-dependent but legal addresses
-  // (e.g. a term multiplied by i // 4 with i in [0, 4)) prove continuous.
-  // This adds no facts beyond the loop definitions; it proves nothing
-  // about buffer bounds or cross-point dependencies.
-  if (mapping.is_2d && mapping.serial_var() != nullptr) {
-    const VarNode *serial = mapping.serial_var();
-    const int64_t kept_extent =
-        mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
-    proof.Bind(GetRef<Var>(serial),
-               Range::FromMinExtent(make_zero(serial->dtype),
-                                    IntImm(serial->dtype, kept_extent)));
-  }
-  {
-    PrimExpr identity =
-        access.data_offset - (access.start_offset + mapping.lane_var);
-    if (proof.CanProveEqual(identity, make_zero(identity.dtype()))) {
-      access.pattern = AccessPattern::kContinuous;
-      return access;
-    }
-  }
-
-  // Lane-uniform: the offset does not depend on lane at the current
-  // program point (version/outer-coordinate indices may stay). Proven
-  // over the full lane range with the same bound analyzer.
-  {
-    PrimExpr at_zero =
-        proof.Simplify(SubstituteVar(access.data_offset, mapping.lane_var.get(),
-                                     make_zero(access.data_offset.dtype())));
-    if (proof.CanProveEqual(access.data_offset, at_zero)) {
-      access.pattern = AccessPattern::kLaneUniform;
-      return access;
-    }
-  }
-
-  std::ostringstream oss;
-  oss << "buffer `" << buffer->name
-      << "`: cannot prove the address is continuous "
-         "(data_offset == start + lane over the full lane range) or "
-         "lane-uniform; only these two patterns are supported";
-  throw PtoAnalysisError(oss.str());
 }
 
 bool IsSupportedElementDType(DataType dtype) {
@@ -1271,7 +1866,8 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
       }
     }
     void VisitStmt_(const ForNode *op) final {
-      scan_->has_any_parallel |= op->kind == ForKind::kParallel;
+      scan_->has_any_parallel |=
+          op->kind == ForKind::kParallel && !UsesExplicitSIMD(op->body);
       int saved = forbidden_depth_;
       if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
         ++forbidden_depth_;
@@ -1322,6 +1918,40 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
   return scan;
 }
 
+ValueInfo ValueInfo::Vmi(DataType dtype) {
+  return {dtype.lanes() == 1 ? ValueKind::kOneLaneVmi : ValueKind::kVectorVmi,
+          dtype.lanes()};
+}
+
+ValueInfo GetValueInfo(const PrimExpr &value, const ValueInfoMap &bindings) {
+  if (auto var = value.as<Var>()) {
+    auto it = bindings.find(var.value());
+    if (it != bindings.end()) {
+      return it->second;
+    }
+  }
+  const DataType dtype = value.dtype();
+  // Parallel binds every VMI data producer before returning it to a consumer.
+  if (dtype.is_scalar()) {
+    return {ValueKind::kScalar, 1};
+  }
+  return {};
+}
+
+WidthAdaptation PlanWidthAdaptation(const ValueInfo &value, int64_t lanes) {
+  if (value.kind == ValueKind::kScalar) {
+    return WidthAdaptation::kBroadcastScalar;
+  }
+  if (value.IsVmi() && value.logical_lanes == lanes) {
+    return WidthAdaptation::kKeep;
+  }
+  if (value.kind == ValueKind::kOneLaneVmi) {
+    return WidthAdaptation::kBroadcastOneLane;
+  }
+  throw PtoAnalysisError("cannot adapt PTO value to consumer lane width " +
+                         std::to_string(lanes));
+}
+
 std::string LaneUseToString(LaneUse use) {
   switch (use) {
   case LaneUse::kUniform:
@@ -1361,7 +1991,8 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     if (var == ctx->loop_var.get()) {
       return LaneUse::kVarying;
     }
-    if (ctx->serial_var.defined() && var == ctx->serial_var.get()) {
+    if (auto serial = ctx->mapping.SerialVar();
+        serial && var == serial.value().get()) {
       // The coordinate of the non-vectorized
       // dimension is a uniform scalar at the program point.
       return LaneUse::kUniform;
@@ -1433,16 +2064,19 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
     try {
-      auto access = AnalyzeBufferAccess(
-          load->buffer, load->indices, /*is_write=*/false, ctx->loop_var,
-          ctx->mapping, ctx->analyzer, ctx->bind_env);
+      auto access =
+          AnalyzeBufferAccess(load->buffer, load->indices, /*is_write=*/false,
+                              ctx->loop_var, ctx->mapping, ctx->bind_env);
       if (access.pattern == AccessPattern::kLaneUniform) {
         return LaneUse::kUniform;
       }
       return LaneUse::kVarying;
     } catch (const PtoAnalysisError &err) {
       if (reason != nullptr) {
-        *reason = err.what();
+        std::ostringstream oss;
+        oss << "nested access to buffer `" << load->buffer->name
+            << "`: " << err.what();
+        *reason = oss.str();
       }
       return LaneUse::kUnknown;
     }
