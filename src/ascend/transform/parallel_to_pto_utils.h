@@ -58,6 +58,8 @@ enum class AccessPattern {
   kContinuous,
   /*! Address independent of lane at the current program point. */
   kLaneUniform,
+  /*! Per-lane element offsets lowered by gather/scatter. */
+  kIndexed,
 };
 
 std::string AccessPatternToString(AccessPattern pattern);
@@ -73,18 +75,21 @@ struct MemoryAccess {
   DataType elem_dtype;
   bool is_write = false;
 
-  /*! Full element offset relative to buffer->data, incl. elem_offset,
-   * version dims, outer coordinates and chunk offset (lane term included).
+  /*! Source element offset; convert at the current source program point. */
+  PrimExpr original_offset;
+  /*! Uniform-axis base candidate; source coordinates and loaded SSA preserved.
    */
-  PrimExpr data_offset;
+  PrimExpr scalar_base_offset;
+  /*! Conservative nonnegative span of lane-varying logical axes. */
+  PrimExpr relative_extent;
+  /*! Unflattened source indices, preserving explicit casts. */
+  Array<PrimExpr> source_indices;
   /*! indices_after_inverse: buffer indices with the inverse-mapped logical
    * coordinates (lane appears via the lane Var in one index). */
   Array<PrimExpr> indices_after_inverse;
   /*! indices with lane bound to 0: the start element of this vector access.
    */
   Array<PrimExpr> start_indices;
-  /*! data_offset with lane bound to 0. */
-  PrimExpr start_offset;
   AccessPattern pattern = AccessPattern::kUnknown;
 };
 
@@ -179,6 +184,12 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  const PtoInverseMapping &mapping,
                                  arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env = {});
+
+/*! Remove only ElemOffset's widening of a native source index. Explicit
+ * source casts and flattened address arithmetic retain their original width.
+ * Throws when the resulting offset would need implicit narrowing. */
+PrimExpr PreparePtoIndexedOffset(const MemoryAccess &access,
+                                 const PrimExpr &relative);
 
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry

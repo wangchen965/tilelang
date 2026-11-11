@@ -1496,7 +1496,8 @@ def test_wrapping_condition_keeps_branch_assertions_scoped(access_position):
     i = tirx.Var("i", "int32")
     condition = tirx.Cast("uint32", i - 1) < _int(2, "uint32")
     assertion = tirx.AssertStmt(i < 2, tirx.StringImm("range"))
-    store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
+    pointer = _access_ptr(work, [_int(0), _int(0)], 128, 2)
+    store = _evaluate(_vstore(_vec("value"), pointer, offset=64 * i))
     # Only a store in the assertion's own branch may use its i < 2 fact.
     # At i == 3 the assertion does not execute and an unguarded store is OOB.
     if access_position == "then":
@@ -1509,7 +1510,7 @@ def test_wrapping_condition_keeps_branch_assertions_scoped(access_position):
     if access_position == "then":
         _assert_no_raw_address(_run(_sblock(body, work)))
         return
-    with pytest.raises(tvm.error.InternalError, match="cannot construct a descriptor"):
+    with pytest.raises(tvm.error.InternalError, match="complete physical access envelope exceeds the descriptor"):
         _run(_sblock(body, work))
 
 
@@ -1521,7 +1522,8 @@ def test_body_assertions_stay_in_their_statement_scope(scope, access_position):
     execute_body = tirx.Var("execute_body", "bool")
     unsafe = tirx.Cast("int32", tirx.Cast("uint32", i - 1))
     assertion = tirx.AssertStmt(i < 2, tirx.StringImm("range"))
-    store = _evaluate(_vstore(_vec("value"), _load(work, [_int(0), 64 * i])))
+    pointer = _access_ptr(work, [_int(0), _int(0)], 128, 2)
+    store = _evaluate(_vstore(_vec("value"), pointer, offset=64 * i))
     scoped_body = tirx.SeqStmt([assertion, store]) if access_position == "inside" else assertion
     if scope == "for_min":
         wrapper = tirx.For(j, unsafe, 0, tirx.ForKind.SERIAL, scoped_body)
@@ -1551,7 +1553,7 @@ def test_body_assertions_stay_in_their_statement_scope(scope, access_position):
         assert len(_vmi_calls(result, "tl.vmi.vstore")) == 1
         _assert_no_raw_address(result)
     else:
-        with pytest.raises(tvm.error.InternalError, match="cannot construct a descriptor"):
+        with pytest.raises(tvm.error.InternalError, match="complete physical access envelope exceeds the descriptor"):
             _run(_sblock(body, work), params=[execute_body])
 
 
